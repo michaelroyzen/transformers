@@ -19,7 +19,7 @@ import pytest
 from parameterized import parameterized
 
 from transformers import Cache, is_torch_available
-from transformers.testing_utils import require_torch, require_torch_accelerator, slow
+from transformers.testing_utils import require_torch, require_torch_accelerator, require_torch_gpu, slow
 
 from ...causal_lm_tester import CausalLMModelTest, CausalLMModelTester
 from ...test_modeling_common import (
@@ -33,6 +33,7 @@ if is_torch_available():
 
     from transformers import (
         AutoTokenizer,
+        DeepseekV32Config,
         DeepseekV32ForCausalLM,
         DeepseekV32Model,
     )
@@ -238,6 +239,66 @@ class DeepseekV32ModelTest(CausalLMModelTest, unittest.TestCase):
     @unittest.skip("MoE routing on a tiny randomly-initialized model makes the overfit target unstable.")
     def test_training_overfit(self):
         pass
+
+    @require_torch_gpu
+    def test_triton_mla_uses_valid_all_fast_path_with_padding(self):
+        config = DeepseekV32Config(
+            vocab_size=128,
+            hidden_size=32,
+            intermediate_size=64,
+            moe_intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            q_lora_rank=8,
+            kv_lora_rank=8,
+            qk_rope_head_dim=8,
+            qk_nope_head_dim=8,
+            v_head_dim=16,
+            num_experts_per_tok=2,
+            n_routed_experts=4,
+            num_experts=4,
+            n_group=2,
+            topk_group=1,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=64,
+            pad_token_id=0,
+            attn_implementation="deepseek_mla_triton",
+        )
+        config.dsa_chunk_size = 4
+        model = DeepseekV32ForCausalLM(config).to("cuda", dtype=torch.bfloat16).train()
+        input_ids = torch.randint(1, config.vocab_size, (2, 12), device="cuda")
+        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        attention_mask[0, 8:] = False
+
+        import transformers.models.deepseek_v32.modeling_deepseek_v32 as modeling_deepseek_v32
+
+        calls = {"valid_all": 0, "fallback": 0}
+        original_valid_all = modeling_deepseek_v32.sparse_mla_triton_valid_all
+        original_fallback = modeling_deepseek_v32.sparse_mla_triton
+
+        def wrapped_valid_all(*args, **kwargs):
+            calls["valid_all"] += 1
+            return original_valid_all(*args, **kwargs)
+
+        def wrapped_fallback(*args, **kwargs):
+            calls["fallback"] += 1
+            return original_fallback(*args, **kwargs)
+
+        modeling_deepseek_v32.sparse_mla_triton_valid_all = wrapped_valid_all
+        modeling_deepseek_v32.sparse_mla_triton = wrapped_fallback
+        try:
+            loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids, use_cache=False).loss
+            loss.backward()
+        finally:
+            modeling_deepseek_v32.sparse_mla_triton_valid_all = original_valid_all
+            modeling_deepseek_v32.sparse_mla_triton = original_fallback
+
+        self.assertGreater(calls["valid_all"], 0)
+        self.assertGreater(calls["fallback"], 0)
 
 
 @slow
