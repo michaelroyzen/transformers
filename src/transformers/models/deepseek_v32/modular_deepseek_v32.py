@@ -30,6 +30,7 @@ import torch.nn.functional as F
 from huggingface_hub.dataclasses import strict
 
 from ...cache_utils import Cache
+from ...masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, sdpa_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_rope_utils import RotaryEmbeddingConfigMixin
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -48,9 +49,24 @@ from ..deepseek_v3.modeling_deepseek_v3 import (
 )
 from ..glm4_moe_lite.configuration_glm4_moe_lite import Glm4MoeLiteConfig
 from ..glm4_moe_lite.modeling_glm4_moe_lite import Glm4MoeLiteDecoderLayer
+from .sparse_mla_triton import sparse_mla_triton
 
 
 logger = logging.get_logger(__name__)
+
+
+def deepseek_mla_attention_forward(*args, **kwargs):
+    raise RuntimeError("DeepSeek-V3.2 handles `deepseek_mla` inside `DeepseekV32Attention.forward`.")
+
+
+def deepseek_mla_triton_attention_forward(*args, **kwargs):
+    raise RuntimeError("DeepSeek-V3.2 handles `deepseek_mla_triton` inside `DeepseekV32Attention.forward`.")
+
+
+ALL_ATTENTION_FUNCTIONS.register("deepseek_mla", deepseek_mla_attention_forward)
+ALL_ATTENTION_FUNCTIONS.register("deepseek_mla_triton", deepseek_mla_triton_attention_forward)
+ALL_MASK_ATTENTION_FUNCTIONS.register("deepseek_mla", sdpa_mask)
+ALL_MASK_ATTENTION_FUNCTIONS.register("deepseek_mla_triton", sdpa_mask)
 
 
 @auto_docstring(checkpoint="deepseek-ai/DeepSeek-V3.2-Exp")
@@ -293,30 +309,284 @@ class DeepseekV32Attention(DeepseekV3Attention):
         q_states = self.q_b_proj(q_resid).view(query_shape).transpose(1, 2)
         q_pass, q_rot = torch.split(q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
+        use_flash_attention = self.config._attn_implementation == "flash_attention_2"
+        use_deepseek_mla = self.config._attn_implementation == "deepseek_mla"
+        use_deepseek_mla_triton = self.config._attn_implementation == "deepseek_mla_triton"
+
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        k_pass, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pass = self.kv_b_proj(self.kv_a_layernorm(k_pass)).view(key_shape).transpose(1, 2)
-        k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        kv_c, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_c_normed = self.kv_a_layernorm(kv_c)
 
         k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
         cos, sin = position_embeddings
         q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin)
-        k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
-
-        query_states = torch.cat((q_pass, q_rot), dim=-1)
-        key_states = torch.cat((k_pass, k_rot), dim=-1)
-
-        if past_key_values is not None:
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
-
-        # The indexer scores against a 3D `[B, S, T]` mask; the attention mask is 4D `[B, 1, S, T]`.
-        indexer_mask = attention_mask[:, 0, :, :] if attention_mask is not None else None
-        topk_indices = self.indexer(
-            hidden_states, q_resid, position_embeddings, indexer_mask, position_ids, past_key_values=past_key_values
-        )  # [B, S, topk]
 
         sparse_indices = None
-        if self.config._attn_implementation in ("eager", "sdpa"):
+        if use_deepseek_mla or use_deepseek_mla_triton:
+            if past_key_values is not None:
+                raise NotImplementedError(
+                    "DeepSeek-V3.2 MLA attention currently supports training/prefill without cache."
+                )
+
+            kv_b_proj_weight = self.kv_b_proj.weight.view(
+                self.num_heads,
+                self.qk_nope_head_dim + self.v_head_dim,
+                self.kv_lora_rank,
+            )
+            w_uk = kv_b_proj_weight[:, : self.qk_nope_head_dim, :]
+            w_uv = kv_b_proj_weight[:, self.qk_nope_head_dim :, :]
+
+            key_positions = torch.arange(seq_length, device=hidden_states.device)
+            key_states = torch.cat((kv_c_normed[:, :, None, :], k_rot.transpose(1, 2)), dim=-1)
+            value_states = F.pad(kv_c_normed[:, :, None, :], (0, self.qk_rope_head_dim))
+            _, _, num_key_value_heads, qk_head_dim = key_states.shape
+            key_states = key_states.squeeze(2)
+            value_states = value_states.squeeze(2)
+
+            indexer_k = self.indexer.k_norm(self.indexer.wk(hidden_states)).unsqueeze(2)
+            indexer_k_rot, indexer_k_pass = torch.split(
+                indexer_k,
+                [self.indexer.qk_rope_head_dim, self.indexer.head_dim - self.indexer.qk_rope_head_dim],
+                dim=-1,
+            )
+            _, indexer_k_rot = apply_rotary_pos_emb(
+                indexer_k_rot, indexer_k_rot, position_embeddings[0], position_embeddings[1], unsqueeze_dim=2
+            )
+            indexer_k = torch.cat([indexer_k_rot, indexer_k_pass], dim=-1).squeeze(2)
+
+            if use_deepseek_mla:
+                from flash_attn import flash_attn_varlen_func
+
+            attn_output = hidden_states.new_empty(batch_size, seq_length, self.num_heads, self.v_head_dim)
+            chunk_size = getattr(self.config, "dsa_chunk_size", 128)
+            for chunk_start in range(0, seq_length, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, seq_length)
+                chunk_len = chunk_end - chunk_start
+
+                ql_nope = torch.einsum("bhsp,hpl->bshl", q_pass[:, :, chunk_start:chunk_end], w_uk)
+                query_states = torch.cat((ql_nope, q_rot[:, :, chunk_start:chunk_end].transpose(1, 2)), dim=-1)
+
+                indexer_q = self.indexer.wq_b(q_resid[:, chunk_start:chunk_end])
+                indexer_q = indexer_q.view(batch_size, chunk_len, self.indexer.n_heads, self.indexer.head_dim)
+                indexer_q_rot, indexer_q_pass = torch.split(
+                    indexer_q,
+                    [self.indexer.qk_rope_head_dim, self.indexer.head_dim - self.indexer.qk_rope_head_dim],
+                    dim=-1,
+                )
+                indexer_q_rot, _ = apply_rotary_pos_emb(
+                    indexer_q_rot,
+                    indexer_k_rot[:, chunk_start:chunk_end],
+                    position_embeddings[0][:, chunk_start:chunk_end],
+                    position_embeddings[1][:, chunk_start:chunk_end],
+                    unsqueeze_dim=2,
+                )
+                indexer_q = torch.cat([indexer_q_rot, indexer_q_pass], dim=-1)
+                indexer_scores = (
+                    torch.matmul(indexer_q.float(), indexer_k.transpose(-1, -2).float().unsqueeze(1))
+                    * self.indexer.softmax_scale
+                )
+                indexer_scores = F.relu(indexer_scores)
+                indexer_weights = self.indexer.weights_proj(
+                    hidden_states[:, chunk_start:chunk_end].to(self.indexer.weights_proj.weight.dtype)
+                ).float() * (self.indexer.n_heads**-0.5)
+                index_scores = torch.matmul(indexer_weights.unsqueeze(-2), indexer_scores).squeeze(-2)
+
+                valid_indexer_positions = key_positions[None, None, :] <= position_ids[:, chunk_start:chunk_end, None]
+                valid_indexer_positions = valid_indexer_positions.expand(batch_size, -1, -1)
+                if attention_mask is not None:
+                    if attention_mask.ndim == 4:
+                        valid_indexer_positions = (
+                            valid_indexer_positions & attention_mask[:, 0, chunk_start:chunk_end, :].bool()
+                        )
+                    else:
+                        valid_indexer_positions = (
+                            valid_indexer_positions & attention_mask[:, None, -seq_length:].bool()
+                        )
+                index_scores = index_scores.masked_fill(~valid_indexer_positions, float("-inf"))
+                topk = min(self.indexer.index_topk, seq_length)
+                topk_indices = index_scores.topk(topk, dim=-1).indices.to(torch.int32)
+                valid_topk = valid_indexer_positions.gather(-1, topk_indices.long())
+
+                if use_deepseek_mla_triton:
+                    latent_output = sparse_mla_triton(
+                        query_states,
+                        key_states,
+                        value_states,
+                        topk_indices,
+                        valid_topk,
+                        self.scaling,
+                    )[..., : self.kv_lora_rank]
+                else:
+                    key_gather_indices = (
+                        topk_indices[:, :, :, None, None].long().expand(batch_size, chunk_len, topk, 1, qk_head_dim)
+                    )
+                    selected_key_states = (
+                        key_states[:, None, :, None, :]
+                        .expand(batch_size, chunk_len, seq_length, 1, qk_head_dim)
+                        .gather(2, key_gather_indices)
+                        .reshape(batch_size * chunk_len, topk, 1, qk_head_dim)
+                    )
+                    selected_value_states = (
+                        value_states[:, None, :, None, :]
+                        .expand(batch_size, chunk_len, seq_length, 1, qk_head_dim)
+                        .gather(2, key_gather_indices)
+                        .reshape(batch_size * chunk_len, topk, 1, qk_head_dim)
+                    )
+                    valid_topk_flat = valid_topk.reshape(batch_size * chunk_len, topk)
+                    key_lengths = valid_topk_flat.sum(dim=-1, dtype=torch.int32)
+                    cu_seqlens_q = torch.arange(
+                        batch_size * chunk_len + 1, device=hidden_states.device, dtype=torch.int32
+                    )
+                    cu_seqlens_k = F.pad(torch.cumsum(key_lengths, dim=0, dtype=torch.int32), (1, 0))
+                    latent_output = flash_attn_varlen_func(
+                        query_states.reshape(batch_size * chunk_len, self.num_heads, qk_head_dim),
+                        selected_key_states[valid_topk_flat],
+                        selected_value_states[valid_topk_flat],
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_k,
+                        max_seqlen_q=1,
+                        max_seqlen_k=int(key_lengths.max().item()),
+                        dropout_p=0.0 if not self.training else self.attention_dropout,
+                        softmax_scale=self.scaling,
+                        causal=False,
+                    ).view(batch_size, chunk_len, self.num_heads, qk_head_dim)[..., : self.kv_lora_rank]
+                attn_output[:, chunk_start:chunk_end] = torch.einsum("bshl,hvl->bshv", latent_output, w_uv)
+            attn_weights = None
+        else:
+            k_pass = self.kv_b_proj(kv_c_normed).view(key_shape).transpose(1, 2)
+            k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
+
+            query_states = torch.cat((q_pass, q_rot), dim=-1)
+            key_states = torch.cat((k_pass, k_rot), dim=-1)
+
+            if past_key_values is not None:
+                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+        if use_deepseek_mla or use_deepseek_mla_triton:
+            pass
+        elif use_flash_attention:
+            value_head_dim = value_states.shape[-1]
+            if value_head_dim != query_states.shape[-1]:
+                value_states = F.pad(value_states, (0, query_states.shape[-1] - value_head_dim))
+
+            _, num_heads, key_length, qk_head_dim = key_states.shape
+            key_positions = torch.arange(key_length, device=hidden_states.device)
+            indexer_k = self.indexer.k_norm(self.indexer.wk(hidden_states)).unsqueeze(2)
+            indexer_k_rot, indexer_k_pass = torch.split(
+                indexer_k,
+                [self.indexer.qk_rope_head_dim, self.indexer.head_dim - self.indexer.qk_rope_head_dim],
+                dim=-1,
+            )
+            _, indexer_k_rot = apply_rotary_pos_emb(
+                indexer_k_rot, indexer_k_rot, position_embeddings[0], position_embeddings[1], unsqueeze_dim=2
+            )
+            indexer_k = torch.cat([indexer_k_rot, indexer_k_pass], dim=-1).squeeze(2)
+
+            from flash_attn import flash_attn_varlen_func
+
+            attn_output = hidden_states.new_empty(batch_size, seq_length, num_heads, value_head_dim)
+            chunk_size = getattr(self.config, "dsa_chunk_size", 128)
+            for chunk_start in range(0, seq_length, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, seq_length)
+                chunk_len = chunk_end - chunk_start
+                indexer_q = self.indexer.wq_b(q_resid[:, chunk_start:chunk_end])
+                indexer_q = indexer_q.view(batch_size, chunk_len, self.indexer.n_heads, self.indexer.head_dim)
+                indexer_q_rot, indexer_q_pass = torch.split(
+                    indexer_q,
+                    [self.indexer.qk_rope_head_dim, self.indexer.head_dim - self.indexer.qk_rope_head_dim],
+                    dim=-1,
+                )
+                indexer_q_rot, _ = apply_rotary_pos_emb(
+                    indexer_q_rot,
+                    indexer_k_rot[:, chunk_start:chunk_end],
+                    position_embeddings[0][:, chunk_start:chunk_end],
+                    position_embeddings[1][:, chunk_start:chunk_end],
+                    unsqueeze_dim=2,
+                )
+                indexer_q = torch.cat([indexer_q_rot, indexer_q_pass], dim=-1)
+                indexer_scores = (
+                    torch.matmul(indexer_q.float(), indexer_k.transpose(-1, -2).float().unsqueeze(1))
+                    * self.indexer.softmax_scale
+                )
+                indexer_scores = F.relu(indexer_scores)
+                indexer_weights = self.indexer.weights_proj(
+                    hidden_states[:, chunk_start:chunk_end].to(self.indexer.weights_proj.weight.dtype)
+                ).float() * (self.indexer.n_heads**-0.5)
+                index_scores = torch.matmul(indexer_weights.unsqueeze(-2), indexer_scores).squeeze(-2)
+
+                valid_indexer_positions = key_positions[None, None, :] <= position_ids[:, chunk_start:chunk_end, None]
+                valid_indexer_positions = valid_indexer_positions.expand(batch_size, -1, -1)
+                if attention_mask is not None:
+                    if attention_mask.ndim == 4:
+                        valid_indexer_positions = (
+                            valid_indexer_positions & attention_mask[:, 0, chunk_start:chunk_end, :].bool()
+                        )
+                    else:
+                        valid_indexer_positions = (
+                            valid_indexer_positions & attention_mask[:, None, -key_length:].bool()
+                        )
+                index_scores = index_scores.masked_fill(~valid_indexer_positions, float("-inf"))
+                topk = min(self.indexer.index_topk, key_length)
+                topk_indices = index_scores.topk(topk, dim=-1).indices.to(torch.int32)
+                valid_topk = valid_indexer_positions.gather(-1, topk_indices.long())
+
+                key_gather_indices = (
+                    topk_indices[:, None, :, :, None]
+                    .long()
+                    .expand(batch_size, num_heads, chunk_len, topk, qk_head_dim)
+                )
+                selected_key_states = (
+                    key_states[:, :, None, :, :]
+                    .expand(batch_size, num_heads, chunk_len, key_length, qk_head_dim)
+                    .gather(3, key_gather_indices)
+                    .permute(0, 2, 3, 1, 4)
+                    .reshape(batch_size * chunk_len, topk, num_heads, qk_head_dim)
+                )
+                selected_value_states = (
+                    value_states[:, :, None, :, :]
+                    .expand(batch_size, num_heads, chunk_len, key_length, qk_head_dim)
+                    .gather(3, key_gather_indices)
+                    .permute(0, 2, 3, 1, 4)
+                    .reshape(batch_size * chunk_len, topk, num_heads, qk_head_dim)
+                )
+                valid_topk = valid_topk.reshape(batch_size * chunk_len, topk)
+                key_lengths = valid_topk.sum(dim=-1, dtype=torch.int32)
+                cu_seqlens_q = torch.arange(batch_size * chunk_len + 1, device=hidden_states.device, dtype=torch.int32)
+                cu_seqlens_k = F.pad(torch.cumsum(key_lengths, dim=0, dtype=torch.int32), (1, 0))
+                chunk_output = flash_attn_varlen_func(
+                    query_states[:, :, chunk_start:chunk_end]
+                    .transpose(1, 2)
+                    .reshape(batch_size * chunk_len, num_heads, qk_head_dim),
+                    selected_key_states[valid_topk],
+                    selected_value_states[valid_topk],
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=1,
+                    max_seqlen_k=int(key_lengths.max().item()),
+                    dropout_p=0.0 if not self.training else self.attention_dropout,
+                    softmax_scale=self.scaling,
+                    causal=False,
+                ).view(batch_size, chunk_len, num_heads, qk_head_dim)
+                if chunk_output.shape[-1] != value_head_dim:
+                    chunk_output = chunk_output[..., :value_head_dim]
+                attn_output[:, chunk_start:chunk_end] = chunk_output
+            attn_weights = None
+        else:
+            # The indexer scores against a 3D `[B, S, T]` mask; the attention mask is 4D `[B, 1, S, T]`.
+            indexer_mask = attention_mask[:, 0, :, :] if attention_mask is not None else None
+            topk_indices = self.indexer(
+                hidden_states,
+                q_resid,
+                position_embeddings,
+                indexer_mask,
+                position_ids,
+                past_key_values=past_key_values,
+            )  # [B, S, topk]
+
+        if use_deepseek_mla or use_flash_attention:
+            pass
+        elif self.config._attn_implementation in ("eager", "sdpa"):
             # Boolean mask: `True` at keys *not* selected by the indexer (to be masked out).
             index_mask = (
                 topk_indices.new_ones((batch_size, seq_length, key_states.shape[2]), dtype=torch.bool)
@@ -331,20 +601,21 @@ class DeepseekV32Attention(DeepseekV3Attention):
         else:
             sparse_indices = topk_indices
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            indices=sparse_indices,
-            **kwargs,
-        )
+        if not (use_deepseek_mla or use_flash_attention):
+            attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+                self.config._attn_implementation, eager_attention_forward
+            )
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                indices=sparse_indices,
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -359,7 +630,7 @@ class DeepseekV32PreTrainedModel(DeepseekV3PreTrainedModel):
     _keep_in_fp32_modules = ["indexer.weights_proj"]
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
     _keys_to_ignore_on_load_unexpected = [r"model\.layers\.61.*"]
-    _supports_flash_attn = False  # flash-mla kernels need a bit more work in the way we enable them!
+    _supports_flash_attn = True
     _supports_sdpa = True
     _supports_flex_attn = False
 
