@@ -49,7 +49,7 @@ from ..deepseek_v3.modeling_deepseek_v3 import (
 )
 from ..glm4_moe_lite.configuration_glm4_moe_lite import Glm4MoeLiteConfig
 from ..glm4_moe_lite.modeling_glm4_moe_lite import Glm4MoeLiteDecoderLayer
-from .sparse_mla_triton import sparse_mla_triton
+from .sparse_mla_triton import sparse_mla_triton, sparse_mla_triton_projected, sparse_mla_triton_valid_all
 
 
 logger = logging.get_logger(__name__)
@@ -408,14 +408,39 @@ class DeepseekV32Attention(DeepseekV3Attention):
                 valid_topk = valid_indexer_positions.gather(-1, topk_indices.long())
 
                 if use_deepseek_mla_triton:
-                    latent_output = sparse_mla_triton(
-                        query_states,
-                        key_states,
-                        value_states,
-                        topk_indices,
-                        valid_topk,
-                        self.scaling,
-                    )[..., : self.kv_lora_rank]
+                    topk_sort_order = topk_indices.argsort(dim=-1)
+                    topk_indices = topk_indices.gather(-1, topk_sort_order)
+                    valid_topk = valid_topk.gather(-1, topk_sort_order)
+                    if self.training and torch.is_grad_enabled():
+                        # TODO: support the valid-all fast path for padded batches by deriving per-row effective
+                        # key lengths from structured padding masks. Padding is still correct today via fallback.
+                        chunk_valid_all = attention_mask is None and bool(
+                            torch.all(position_ids[:, chunk_start:chunk_end] >= topk - 1)
+                        )
+                        sparse_mla_fn = (
+                            sparse_mla_triton_valid_all
+                            if chunk_valid_all
+                            else sparse_mla_triton
+                        )
+                        latent_output = sparse_mla_fn(
+                            query_states,
+                            key_states,
+                            value_states,
+                            topk_indices,
+                            valid_topk,
+                            self.scaling,
+                        )[..., : self.kv_lora_rank]
+                        attn_output[:, chunk_start:chunk_end] = torch.einsum("bshl,hvl->bshv", latent_output, w_uv)
+                    else:
+                        attn_output[:, chunk_start:chunk_end] = sparse_mla_triton_projected(
+                            query_states,
+                            key_states,
+                            value_states,
+                            topk_indices,
+                            valid_topk,
+                            w_uv,
+                            self.scaling,
+                        )
                 else:
                     key_gather_indices = (
                         topk_indices[:, :, :, None, None].long().expand(batch_size, chunk_len, topk, 1, qk_head_dim)
@@ -450,7 +475,7 @@ class DeepseekV32Attention(DeepseekV3Attention):
                         softmax_scale=self.scaling,
                         causal=False,
                     ).view(batch_size, chunk_len, self.num_heads, qk_head_dim)[..., : self.kv_lora_rank]
-                attn_output[:, chunk_start:chunk_end] = torch.einsum("bshl,hvl->bshv", latent_output, w_uv)
+                    attn_output[:, chunk_start:chunk_end] = torch.einsum("bshl,hvl->bshv", latent_output, w_uv)
             attn_weights = None
         else:
             k_pass = self.kv_b_proj(kv_c_normed).view(key_shape).transpose(1, 2)
@@ -584,7 +609,7 @@ class DeepseekV32Attention(DeepseekV3Attention):
                 past_key_values=past_key_values,
             )  # [B, S, topk]
 
-        if use_deepseek_mla or use_flash_attention:
+        if use_deepseek_mla or use_deepseek_mla_triton or use_flash_attention:
             pass
         elif self.config._attn_implementation in ("eager", "sdpa"):
             # Boolean mask: `True` at keys *not* selected by the indexer (to be masked out).
@@ -601,7 +626,7 @@ class DeepseekV32Attention(DeepseekV3Attention):
         else:
             sparse_indices = topk_indices
 
-        if not (use_deepseek_mla or use_flash_attention):
+        if not (use_deepseek_mla or use_deepseek_mla_triton or use_flash_attention):
             attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
                 self.config._attn_implementation, eager_attention_forward
             )
