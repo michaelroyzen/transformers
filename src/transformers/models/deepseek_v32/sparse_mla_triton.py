@@ -891,7 +891,6 @@ class _SparseMLAValidAllTritonFunction(torch.autograd.Function):
         k = k.contiguous()
         v = v.contiguous()
         topk = topk.contiguous()
-        valid = valid.contiguous()
         batch_size, query_len, num_heads, head_dim = q.shape
         kv_len = k.shape[1]
         topk_n = topk.shape[-1]
@@ -919,7 +918,7 @@ class _SparseMLAValidAllTritonFunction(torch.autograd.Function):
             num_warps=num_warps,
             num_stages=num_stages,
         )
-        ctx.save_for_backward(q, k, v, topk, valid, out)
+        ctx.save_for_backward(q, k, v, topk, out)
         ctx.scale = scale
         ctx.block_d = block_d
         ctx.block_n = block_n
@@ -930,7 +929,7 @@ class _SparseMLAValidAllTritonFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
-        q, k, v, topk, valid, out = ctx.saved_tensors
+        q, k, v, topk, out = ctx.saved_tensors
         dout = dout.contiguous()
         batch_size, query_len, num_heads, head_dim = q.shape
         kv_len = k.shape[1]
@@ -944,7 +943,7 @@ class _SparseMLAValidAllTritonFunction(torch.autograd.Function):
             k,
             v,
             topk,
-            valid,
+            topk,
             out,
             dout,
             dq,
