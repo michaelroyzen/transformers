@@ -528,33 +528,30 @@ class DeepseekV32Attention(nn.Module):
                 index_scores = index_scores.masked_fill(~valid_indexer_positions, float("-inf"))
                 topk = min(self.indexer.index_topk, seq_length)
                 topk_indices = index_scores.topk(topk, dim=-1).indices.to(torch.int32)
-                valid_topk = valid_indexer_positions.gather(-1, topk_indices.long())
+                valid_topk = None
 
                 if use_deepseek_mla_triton:
                     topk_sort_order = topk_indices.argsort(dim=-1)
                     topk_indices = topk_indices.gather(-1, topk_sort_order)
-                    valid_topk = valid_topk.gather(-1, topk_sort_order)
                     if self.training and torch.is_grad_enabled():
-                        # TODO: support the valid-all fast path for padded batches by deriving per-row effective
-                        # key lengths from structured padding masks. Padding is still correct today via fallback.
                         chunk_valid_all = attention_mask is None and bool(
                             torch.all(position_ids[:, chunk_start:chunk_end] >= topk - 1)
                         )
-                        sparse_mla_fn = (
-                            sparse_mla_triton_valid_all
-                            if chunk_valid_all
-                            else sparse_mla_triton
-                        )
+                        if not chunk_valid_all:
+                            valid_topk = valid_indexer_positions.gather(-1, topk_indices.long())
+                            chunk_valid_all = bool(torch.all(valid_topk))
+                        sparse_mla_fn = sparse_mla_triton_valid_all if chunk_valid_all else sparse_mla_triton
                         latent_output = sparse_mla_fn(
                             query_states,
                             key_states,
                             value_states,
                             topk_indices,
-                            valid_topk,
+                            topk_indices if chunk_valid_all else valid_topk,
                             self.scaling,
                         )[..., : self.kv_lora_rank]
                         attn_output[:, chunk_start:chunk_end] = torch.einsum("bshl,hvl->bshv", latent_output, w_uv)
                     else:
+                        valid_topk = valid_indexer_positions.gather(-1, topk_indices.long())
                         attn_output[:, chunk_start:chunk_end] = sparse_mla_triton_projected(
                             query_states,
                             key_states,
@@ -565,6 +562,7 @@ class DeepseekV32Attention(nn.Module):
                             self.scaling,
                         )
                 else:
+                    valid_topk = valid_indexer_positions.gather(-1, topk_indices.long())
                     key_gather_indices = (
                         topk_indices[:, :, :, None, None].long().expand(batch_size, chunk_len, topk, 1, qk_head_dim)
                     )
