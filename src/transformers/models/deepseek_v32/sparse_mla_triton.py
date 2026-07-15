@@ -1,3 +1,6 @@
+import functools
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -1234,6 +1237,465 @@ class _SparseMLAProjectedTritonFunction(torch.autograd.Function):
 
 def sparse_mla_triton_projected(q, k, v, topk, valid, w_uv, scale):
     return _SparseMLAProjectedTritonFunction.apply(q, k, v, topk, valid, w_uv, scale)
+
+
+# =============================================================================
+# Latent-space sparse MLA (v2)
+#
+# Key differences from the kernels above:
+#   - V-as-K fusion: DeepSeek MLA's value rows are the first LATENT_D columns
+#     of the key rows (the model builds value_states = pad(kv_c_normed) and
+#     key_states = cat(kv_c_normed, k_rot)). The kernels below gather each key
+#     row once and reuse its latent slice as V, halving gather traffic, and the
+#     K/V gradients collapse into ONE atomic buffer instead of two.
+#   - Latent output: returns (B, Q, H, LATENT_D) directly (callers always slice
+#     [..., :kv_lora_rank] anyway), so no compute is spent on the zero rope
+#     columns of the padded V.
+#   - Tensor-core dots: all GEMMs run on the native (bf16/fp16) operands with
+#     fp32 accumulators — flash-attention-2 semantics — instead of the fp32
+#     `input_precision="ieee"` CUDA-core dots of the v1 backward (~20x below
+#     the bf16 tensor-core rate on H200/B300).
+#   - Saved LSE: forward stores per-(b, q, h) logsumexp; backward reconstructs
+#     softmax probabilities from it instead of re-running the online-softmax
+#     pass over all gathered keys (removes one of the v1 backward's two
+#     score passes).
+#   - Larger head tiles: MLA shares each key row across all H=128 query heads,
+#     so BLOCK_H amortizes the random-index gathers; the padded-BLOCK_D dot of
+#     v1 (1024-wide for a 576-dim head) is replaced by exact-width dots on the
+#     512/64 latent/rope split.
+#
+# sm_103 (B300) notes — see triton-lang/triton#10821:
+#   Two tl.dot calls chained through ONE accumulator in a K-loop miscompile on
+#   the tcgen05 MMA path (BLOCK_M >= 64). Every loop below issues exactly one
+#   tl.dot per accumulator per iteration; the latent+rope score split uses two
+#   SEPARATE accumulators that are summed afterwards (the verified-correct
+#   control in the bug report), never `acc = dot(...); acc = dot(..., acc)`.
+# =============================================================================
+
+
+@triton.jit
+def _sparse_mla_latent_fwd_kernel(
+    Q,
+    K,
+    TOPK,
+    VALID,
+    OUT,
+    LSE,
+    Q_LEN: tl.constexpr,
+    KV_LEN: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    LATENT_D: tl.constexpr,
+    ROPE_D: tl.constexpr,
+    TOPK_N: tl.constexpr,
+    SCALE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    VALID_ALL: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    head_blocks: tl.constexpr = (H + BLOCK_H - 1) // BLOCK_H
+    h_block = pid % head_blocks
+    q_pos = (pid // head_blocks) % Q_LEN
+    b = pid // (head_blocks * Q_LEN)
+
+    offs_h = h_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_lat = tl.arange(0, LATENT_D)
+    offs_rope = tl.arange(0, ROPE_D)
+    h_mask = offs_h < H
+    q_row0 = (b * Q_LEN + q_pos) * H
+
+    # Whole q tile for this head block, split into latent / rope halves.
+    q_lat = tl.load(
+        Q + (q_row0 + offs_h[:, None]) * D + offs_lat[None, :],
+        mask=h_mask[:, None],
+        other=0.0,
+    )
+    q_rope = tl.load(
+        Q + (q_row0 + offs_h[:, None]) * D + (LATENT_D + offs_rope[None, :]),
+        mask=h_mask[:, None],
+        other=0.0,
+    )
+
+    m_i = tl.full((BLOCK_H,), -float("inf"), tl.float32)
+    l_i = tl.zeros((BLOCK_H,), tl.float32)
+    acc = tl.zeros((BLOCK_H, LATENT_D), tl.float32)
+
+    for start in tl.range(0, TOPK_N, BLOCK_N):
+        offs_n = start + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < TOPK_N
+        idx = tl.load(
+            TOPK + (b * Q_LEN + q_pos) * TOPK_N + offs_n,
+            mask=n_mask,
+            other=0,
+            eviction_policy="evict_first",
+        )
+        if VALID_ALL:
+            valid = n_mask
+        else:
+            valid = tl.load(
+                VALID + (b * Q_LEN + q_pos) * TOPK_N + offs_n,
+                mask=n_mask,
+                other=0,
+                eviction_policy="evict_first",
+            ).to(tl.int1)
+        k_row = (b * KV_LEN + idx).to(tl.int64)
+
+        # One natural-layout gather per key row; the latent slice doubles as V.
+        k_lat = tl.load(
+            K + k_row[:, None] * D + offs_lat[None, :],
+            mask=valid[:, None],
+            other=0.0,
+            eviction_policy="evict_last",
+        )
+        k_rope = tl.load(
+            K + k_row[:, None] * D + (LATENT_D + offs_rope[None, :]),
+            mask=valid[:, None],
+            other=0.0,
+            eviction_policy="evict_last",
+        )
+
+        # Two separate accumulators summed — NOT one accumulator chained
+        # through two dots (sm_103 tcgen05 miscompile, triton#10821).
+        s_lat = tl.dot(q_lat, tl.trans(k_lat))
+        s_rope = tl.dot(q_rope, tl.trans(k_rope))
+        scores = (s_lat + s_rope) * SCALE
+        scores = tl.where(h_mask[:, None] & valid[None, :], scores, -float("inf"))
+
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+        m_new_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        m_i_safe = tl.where(m_i == -float("inf"), 0.0, m_i)
+        alpha = tl.where(m_i == -float("inf"), 0.0, tl.exp(m_i_safe - m_new_safe))
+        p = tl.where(h_mask[:, None] & valid[None, :], tl.exp(scores - m_new_safe[:, None]), 0.0)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(k_lat.dtype), k_lat, acc)  # single dot per acc per iteration
+        m_i = m_new
+
+    # lse = +inf for fully-masked rows so backward reconstructs p = 0 there.
+    m_final_safe = tl.where(m_i == -float("inf"), 0.0, m_i)
+    lse = tl.where(l_i > 0.0, m_final_safe + tl.log(l_i), float("inf"))
+    tl.store(LSE + (b * Q_LEN + q_pos) * H + offs_h, lse, mask=h_mask)
+
+    out = acc / tl.where(l_i == 0.0, 1.0, l_i)[:, None]
+    tl.store(
+        OUT + (q_row0 + offs_h[:, None]) * LATENT_D + offs_lat[None, :],
+        out.to(OUT.dtype.element_ty),
+        mask=h_mask[:, None],
+    )
+
+
+@triton.jit
+def _sparse_mla_latent_bwd_kernel(
+    Q,
+    K,
+    TOPK,
+    VALID,
+    DOUT,
+    LSE,
+    DELTA,
+    DQ,
+    DKV,
+    Q_LEN: tl.constexpr,
+    KV_LEN: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    LATENT_D: tl.constexpr,
+    ROPE_D: tl.constexpr,
+    TOPK_N: tl.constexpr,
+    SCALE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    VALID_ALL: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    head_blocks: tl.constexpr = (H + BLOCK_H - 1) // BLOCK_H
+    h_block = pid % head_blocks
+    q_pos = (pid // head_blocks) % Q_LEN
+    b = pid // (head_blocks * Q_LEN)
+
+    offs_h = h_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_lat = tl.arange(0, LATENT_D)
+    offs_rope = tl.arange(0, ROPE_D)
+    h_mask = offs_h < H
+    q_row0 = (b * Q_LEN + q_pos) * H
+
+    q_lat = tl.load(
+        Q + (q_row0 + offs_h[:, None]) * D + offs_lat[None, :],
+        mask=h_mask[:, None],
+        other=0.0,
+    )
+    q_rope = tl.load(
+        Q + (q_row0 + offs_h[:, None]) * D + (LATENT_D + offs_rope[None, :]),
+        mask=h_mask[:, None],
+        other=0.0,
+    )
+    dout = tl.load(
+        DOUT + (q_row0 + offs_h[:, None]) * LATENT_D + offs_lat[None, :],
+        mask=h_mask[:, None],
+        other=0.0,
+    )
+    # lse = +inf (=> p = 0) for fully-masked and out-of-range head rows.
+    lse = tl.load(LSE + (b * Q_LEN + q_pos) * H + offs_h, mask=h_mask, other=float("inf"))
+    delta = tl.load(DELTA + (b * Q_LEN + q_pos) * H + offs_h, mask=h_mask, other=0.0)
+
+    dq_lat = tl.zeros((BLOCK_H, LATENT_D), tl.float32)
+    dq_rope = tl.zeros((BLOCK_H, ROPE_D), tl.float32)
+
+    for start in tl.range(0, TOPK_N, BLOCK_N):
+        offs_n = start + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < TOPK_N
+        idx = tl.load(
+            TOPK + (b * Q_LEN + q_pos) * TOPK_N + offs_n,
+            mask=n_mask,
+            other=0,
+            eviction_policy="evict_first",
+        )
+        if VALID_ALL:
+            valid = n_mask
+        else:
+            valid = tl.load(
+                VALID + (b * Q_LEN + q_pos) * TOPK_N + offs_n,
+                mask=n_mask,
+                other=0,
+                eviction_policy="evict_first",
+            ).to(tl.int1)
+        k_row = (b * KV_LEN + idx).to(tl.int64)
+
+        k_lat = tl.load(
+            K + k_row[:, None] * D + offs_lat[None, :],
+            mask=valid[:, None],
+            other=0.0,
+            eviction_policy="evict_last",
+        )
+        k_rope = tl.load(
+            K + k_row[:, None] * D + (LATENT_D + offs_rope[None, :]),
+            mask=valid[:, None],
+            other=0.0,
+            eviction_policy="evict_last",
+        )
+
+        # Separate accumulators summed (sm_103-safe; see module notes).
+        s_lat = tl.dot(q_lat, tl.trans(k_lat))
+        s_rope = tl.dot(q_rope, tl.trans(k_rope))
+        scores = (s_lat + s_rope) * SCALE
+        # p from saved lse — no online-softmax recompute pass.
+        p = tl.where(
+            h_mask[:, None] & valid[None, :],
+            tl.exp(scores - lse[:, None]),
+            0.0,
+        )
+
+        dp = tl.dot(dout, tl.trans(k_lat))  # fresh accumulator
+        ds = p * (dp - delta[:, None]) * SCALE
+
+        p16 = p.to(k_lat.dtype)
+        ds16 = ds.to(k_lat.dtype)
+
+        dq_lat = tl.dot(ds16, k_lat, dq_lat)  # single dot per acc per iteration
+        dq_rope = tl.dot(ds16, k_rope, dq_rope)  # single dot per acc per iteration
+
+        # dK (latent) + dV share the key row: two fresh accumulators, summed
+        # outside the dots, one fp32 atomic per element.
+        dk_lat = tl.dot(tl.trans(ds16), q_lat)
+        dv_lat = tl.dot(tl.trans(p16), dout)
+        tl.atomic_add(
+            DKV + k_row[:, None] * D + offs_lat[None, :],
+            dk_lat + dv_lat,
+            mask=valid[:, None],
+        )
+        dk_rope = tl.dot(tl.trans(ds16), q_rope)
+        tl.atomic_add(
+            DKV + k_row[:, None] * D + (LATENT_D + offs_rope[None, :]),
+            dk_rope,
+            mask=valid[:, None],
+        )
+
+    tl.store(
+        DQ + (q_row0 + offs_h[:, None]) * D + offs_lat[None, :],
+        dq_lat.to(DQ.dtype.element_ty),
+        mask=h_mask[:, None],
+    )
+    tl.store(
+        DQ + (q_row0 + offs_h[:, None]) * D + (LATENT_D + offs_rope[None, :]),
+        dq_rope.to(DQ.dtype.element_ty),
+        mask=h_mask[:, None],
+    )
+
+
+def _env_int(name, default):
+    value = os.environ.get(name)
+    return default if value is None else int(value)
+
+
+@functools.cache
+def _latent_mla_configs():
+    """(BLOCK_H, BLOCK_N, num_warps, num_stages) for (forward, backward).
+
+    Measured on H200 (see fork benchmarks) at DeepSeek-3.2 shapes
+    (H=128, D=576, topk=2048). Blackwell datacenter parts (sm100/sm103) keep
+    BLOCK_H >= 64 tiles: tcgen05 MMA holds the fp32 accumulators in TMEM, so
+    the wide-tile register pressure of Hopper does not apply, and BLOCK_M >= 64
+    single-dot-per-accumulator loops are the pattern already validated bitwise
+    on B300 by the chunked GRPO loss kernels. DSMLA_* env vars override for
+    tuning experiments.
+    """
+    capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+    if capability[0] >= 9:
+        # H200-measured optimum (fwd 0.37 ms / bwd 4.2 ms per 128-query chunk
+        # at topk=2048). Kept identical on sm100/sm103: the SMEM budget is the
+        # same 228 KB (backward BLOCK_H=64 needs 385 KB and fails to launch on
+        # both), and BLOCK_H=64 forward tiles engage tcgen05 with the
+        # single-dot-per-accumulator structure validated on B300.
+        fwd = (64, 64, 8, 2)
+        bwd = (32, 32, 8, 2)
+    else:
+        fwd = (16, 32, 4, 2)
+        bwd = (16, 32, 4, 2)
+    fwd = (
+        _env_int("DSMLA_FWD_BH", fwd[0]),
+        _env_int("DSMLA_FWD_BN", fwd[1]),
+        _env_int("DSMLA_FWD_WARPS", fwd[2]),
+        _env_int("DSMLA_FWD_STAGES", fwd[3]),
+    )
+    bwd = (
+        _env_int("DSMLA_BWD_BH", bwd[0]),
+        _env_int("DSMLA_BWD_BN", bwd[1]),
+        _env_int("DSMLA_BWD_WARPS", bwd[2]),
+        _env_int("DSMLA_BWD_STAGES", bwd[3]),
+    )
+    return fwd, bwd
+
+
+def _latent_kernel_supported(latent_d: int, rope_d: int) -> bool:
+    """The v2 kernels need power-of-2 latent/rope widths that satisfy tl.dot's
+    minimum tile dims. Real DeepSeek-3.2 (512/64) qualifies; tiny test configs
+    fall back to the v1 kernels."""
+    def _pow2(n):
+        return n >= 16 and (n & (n - 1)) == 0
+
+    return _pow2(latent_d) and _pow2(rope_d)
+
+
+class _SparseMLALatentTritonFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, kv, topk, valid, scale, latent_d):
+        q = q.contiguous()
+        kv = kv.contiguous()
+        topk = topk.contiguous()
+        valid_all = valid is None
+        if not valid_all:
+            valid = valid.contiguous()
+        batch_size, query_len, num_heads, head_dim = q.shape
+        kv_len = kv.shape[1]
+        topk_n = topk.shape[-1]
+        rope_d = head_dim - latent_d
+
+        (block_h, block_n, num_warps, num_stages), _ = _latent_mla_configs()
+        out = torch.empty(batch_size, query_len, num_heads, latent_d, device=q.device, dtype=q.dtype)
+        lse = torch.empty(batch_size, query_len, num_heads, device=q.device, dtype=torch.float32)
+        head_blocks = triton.cdiv(num_heads, block_h)
+        _sparse_mla_latent_fwd_kernel[(batch_size * query_len * head_blocks,)](
+            q,
+            kv,
+            topk,
+            topk if valid_all else valid,
+            out,
+            lse,
+            query_len,
+            kv_len,
+            num_heads,
+            head_dim,
+            latent_d,
+            rope_d,
+            topk_n,
+            scale,
+            block_n,
+            block_h,
+            valid_all,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        ctx.save_for_backward(q, kv, topk, out, lse)
+        ctx.valid = valid if not valid_all else None
+        ctx.scale = scale
+        ctx.latent_d = latent_d
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        q, kv, topk, out, lse = ctx.saved_tensors
+        valid = ctx.valid
+        valid_all = valid is None
+        dout = dout.contiguous()
+        batch_size, query_len, num_heads, head_dim = q.shape
+        kv_len = kv.shape[1]
+        topk_n = topk.shape[-1]
+        latent_d = ctx.latent_d
+        rope_d = head_dim - latent_d
+
+        # delta = rowsum(out * dout) per (b, q, h) — one cheap fused pass.
+        delta = (out.float() * dout.float()).sum(dim=-1)
+
+        _, (block_h, block_n, num_warps, num_stages) = _latent_mla_configs()
+        dq = torch.empty_like(q)
+        dkv = torch.zeros_like(kv, dtype=torch.float32)
+        head_blocks = triton.cdiv(num_heads, block_h)
+        _sparse_mla_latent_bwd_kernel[(batch_size * query_len * head_blocks,)](
+            q,
+            kv,
+            topk,
+            topk if valid_all else valid,
+            dout,
+            lse,
+            delta,
+            dq,
+            dkv,
+            query_len,
+            kv_len,
+            num_heads,
+            head_dim,
+            latent_d,
+            rope_d,
+            topk_n,
+            ctx.scale,
+            block_n,
+            block_h,
+            valid_all,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        return dq, dkv.to(kv.dtype), None, None, None, None
+
+
+def sparse_mla_latent_triton(q, kv, topk, valid, scale, latent_d=512):
+    """Sparse MLA over shared latent K/V rows, returning the latent output.
+
+    Args:
+        q:     (B, Q, H, D) queries, D = latent_d + rope_d.
+        kv:    (B, KV, D) key rows = cat(latent, rope); the latent slice
+               doubles as the value matrix (no separate V input).
+        topk:  (B, Q, topk_n) int32 sorted key indices.
+        valid: (B, Q, topk_n) bool validity mask, or None if every index is
+               valid (fast path, skips the mask loads).
+        scale: softmax scale.
+        latent_d: width of the latent slice (DeepSeek-3.2: kv_lora_rank=512).
+
+    Returns:
+        (B, Q, H, latent_d) attention output in q.dtype. Gradients flow to q
+        and kv (the K and V roles of the latent slice are fused into one
+        gradient buffer).
+    """
+    rope_d = q.shape[-1] - latent_d
+    if not _latent_kernel_supported(latent_d, rope_d):
+        # Fallback for tiny/non-power-of-2 test configs: v1 kernels on a
+        # zero-padded V (autograd routes the pad/slice gradients).
+        value = torch.nn.functional.pad(kv[..., :latent_d], (0, rope_d))
+        if valid is None:
+            return _SparseMLAValidAllTritonFunction.apply(q, kv, value, topk, topk, scale)[..., :latent_d]
+        return _SparseMLATritonFunction.apply(q, kv, value, topk, valid, scale)[..., :latent_d]
+    return _SparseMLALatentTritonFunction.apply(q, kv, topk, valid, scale, latent_d)
 
 
 def sparse_mla_triton_projected_split(q, k, v, topk, valid, w_uv, scale, split_n=8):

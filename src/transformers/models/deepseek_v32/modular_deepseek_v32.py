@@ -49,7 +49,7 @@ from ..deepseek_v3.modeling_deepseek_v3 import (
 )
 from ..glm4_moe_lite.configuration_glm4_moe_lite import Glm4MoeLiteConfig
 from ..glm4_moe_lite.modeling_glm4_moe_lite import Glm4MoeLiteDecoderLayer
-from .sparse_mla_triton import sparse_mla_triton, sparse_mla_triton_projected, sparse_mla_triton_valid_all
+from .sparse_mla_triton import sparse_mla_latent_triton
 
 
 logger = logging.get_logger(__name__)
@@ -341,10 +341,12 @@ class DeepseekV32Attention(DeepseekV3Attention):
 
             key_positions = torch.arange(seq_length, device=hidden_states.device)
             key_states = torch.cat((kv_c_normed[:, :, None, :], k_rot.transpose(1, 2)), dim=-1)
-            value_states = F.pad(kv_c_normed[:, :, None, :], (0, self.qk_rope_head_dim))
             _, _, num_key_value_heads, qk_head_dim = key_states.shape
             key_states = key_states.squeeze(2)
-            value_states = value_states.squeeze(2)
+            if use_deepseek_mla:
+                # Only the varlen-flash path materializes a separate zero-padded V;
+                # the Triton latent kernel reuses the latent slice of key_states as V.
+                value_states = F.pad(kv_c_normed[:, :, None, :], (0, self.qk_rope_head_dim)).squeeze(2)
 
             indexer_k = self.indexer.k_norm(self.indexer.wk(hidden_states)).unsqueeze(2)
             indexer_k_rot, indexer_k_pass = torch.split(
@@ -413,34 +415,21 @@ class DeepseekV32Attention(DeepseekV3Attention):
                 if use_deepseek_mla_triton:
                     topk_sort_order = topk_indices.argsort(dim=-1)
                     topk_indices = topk_indices.gather(-1, topk_sort_order)
-                    if self.training and torch.is_grad_enabled():
-                        chunk_valid_all = attention_mask is None and bool(
-                            torch.all(position_ids[:, chunk_start:chunk_end] >= topk - 1)
-                        )
-                        if not chunk_valid_all:
-                            valid_topk = valid_indexer_positions.gather(-1, topk_indices.long())
-                            chunk_valid_all = bool(torch.all(valid_topk))
-                        sparse_mla_fn = sparse_mla_triton_valid_all if chunk_valid_all else sparse_mla_triton
-                        latent_output = sparse_mla_fn(
-                            query_states,
-                            key_states,
-                            value_states,
-                            topk_indices,
-                            topk_indices if chunk_valid_all else valid_topk,
-                            self.scaling,
-                        )[..., : self.kv_lora_rank]
-                        attn_output[:, chunk_start:chunk_end] = torch.einsum("bshl,hvl->bshv", latent_output, w_uv)
-                    else:
+                    chunk_valid_all = attention_mask is None and bool(
+                        torch.all(position_ids[:, chunk_start:chunk_end] >= topk - 1)
+                    )
+                    if not chunk_valid_all:
                         valid_topk = valid_indexer_positions.gather(-1, topk_indices.long())
-                        attn_output[:, chunk_start:chunk_end] = sparse_mla_triton_projected(
-                            query_states,
-                            key_states,
-                            value_states,
-                            topk_indices,
-                            valid_topk,
-                            w_uv,
-                            self.scaling,
-                        )
+                        chunk_valid_all = bool(torch.all(valid_topk))
+                    latent_output = sparse_mla_latent_triton(
+                        query_states,
+                        key_states,
+                        topk_indices,
+                        None if chunk_valid_all else valid_topk,
+                        self.scaling,
+                        latent_d=self.kv_lora_rank,
+                    )
+                    attn_output[:, chunk_start:chunk_end] = torch.einsum("bshl,hvl->bshv", latent_output, w_uv)
                 else:
                     valid_topk = valid_indexer_positions.gather(-1, topk_indices.long())
                     key_gather_indices = (
