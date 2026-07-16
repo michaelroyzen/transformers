@@ -19,7 +19,7 @@ import pytest
 from parameterized import parameterized
 
 from transformers import Cache, is_torch_available
-from transformers.testing_utils import require_torch, require_torch_accelerator, slow
+from transformers.testing_utils import require_torch, require_torch_accelerator, require_torch_gpu, slow
 
 from ...causal_lm_tester import CausalLMModelTest, CausalLMModelTester
 from ...test_modeling_common import (
@@ -33,6 +33,7 @@ if is_torch_available():
 
     from transformers import (
         AutoTokenizer,
+        DeepseekV32Config,
         DeepseekV32ForCausalLM,
         DeepseekV32Model,
     )
@@ -238,6 +239,103 @@ class DeepseekV32ModelTest(CausalLMModelTest, unittest.TestCase):
     @unittest.skip("MoE routing on a tiny randomly-initialized model makes the overfit target unstable.")
     def test_training_overfit(self):
         pass
+
+    @require_torch_gpu
+    def test_triton_mla_uses_valid_all_fast_path_with_padding(self):
+        config = DeepseekV32Config(
+            vocab_size=128,
+            hidden_size=32,
+            intermediate_size=64,
+            moe_intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            q_lora_rank=8,
+            kv_lora_rank=8,
+            qk_rope_head_dim=8,
+            qk_nope_head_dim=8,
+            v_head_dim=16,
+            num_experts_per_tok=2,
+            n_routed_experts=4,
+            num_experts=4,
+            n_group=2,
+            topk_group=1,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=64,
+            pad_token_id=0,
+            attn_implementation="deepseek_mla_triton",
+        )
+        config.dsa_chunk_size = 4
+        model = DeepseekV32ForCausalLM(config).to("cuda", dtype=torch.bfloat16).train()
+        input_ids = torch.randint(1, config.vocab_size, (2, 12), device="cuda")
+        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        attention_mask[0, 8:] = False
+
+        import transformers.models.deepseek_v32.modeling_deepseek_v32 as modeling_deepseek_v32
+
+        calls = {"valid_all": 0, "fallback": 0}
+        original_latent = modeling_deepseek_v32.sparse_mla_latent_triton
+
+        def wrapped_latent(q, kv, topk, valid, scale, latent_d=512):
+            calls["valid_all" if valid is None else "fallback"] += 1
+            return original_latent(q, kv, topk, valid, scale, latent_d=latent_d)
+
+        modeling_deepseek_v32.sparse_mla_latent_triton = wrapped_latent
+        try:
+            loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids, use_cache=False).loss
+            loss.backward()
+        finally:
+            modeling_deepseek_v32.sparse_mla_latent_triton = original_latent
+
+        self.assertGreater(calls["valid_all"], 0)
+        self.assertGreater(calls["fallback"], 0)
+
+    @require_torch_gpu
+    def test_sparse_mla_latent_kernel_matches_eager_reference(self):
+        """Latent-kernel fast path (real 512/64 dims) vs fp32 eager reference, fwd + grads."""
+        from transformers.models.deepseek_v32.sparse_mla_triton import sparse_mla_latent_triton
+
+        torch.manual_seed(0)
+        batch_size, q_len, kv_len, heads, topk_n = 2, 16, 512, 32, 128
+        latent_d, rope_d = 512, 64
+        head_dim = latent_d + rope_d
+        device, dtype = "cuda", torch.bfloat16
+        scale = head_dim**-0.5
+
+        for valid_all in (True, False):
+            q = (torch.randn(batch_size, q_len, heads, head_dim, device=device, dtype=dtype) / 3).requires_grad_(True)
+            kv = (torch.randn(batch_size, kv_len, head_dim, device=device, dtype=dtype) / 3).requires_grad_(True)
+            if valid_all:
+                q_positions = torch.arange(kv_len - q_len, kv_len, device=device)
+            else:
+                q_positions = torch.arange(q_len, device=device)
+            causal = torch.arange(kv_len, device=device)[None, None, :] <= q_positions[None, :, None]
+            scores = torch.randn(batch_size, q_len, kv_len, device=device).masked_fill(~causal, float("-inf"))
+            topk_indices = scores.topk(topk_n, dim=-1).indices.to(torch.int32).sort(dim=-1).values
+            valid = causal.expand(batch_size, -1, -1).gather(-1, topk_indices.long())
+            self.assertEqual(bool(valid.all()), valid_all)
+
+            out = sparse_mla_latent_triton(q, kv, topk_indices, None if valid_all else valid, scale, latent_d)
+            dout = torch.randn_like(out, dtype=torch.float32) / 5
+            out.backward(dout.to(out.dtype))
+
+            q32 = q.detach().float().requires_grad_(True)
+            kv32 = kv.detach().float().requires_grad_(True)
+            idx = topk_indices.long()
+            k_sel = kv32.gather(1, idx.reshape(batch_size, -1)[..., None].expand(-1, -1, head_dim))
+            k_sel = k_sel.reshape(batch_size, q_len, topk_n, head_dim)
+            ref_scores = torch.einsum("bqhd,bqtd->bhqt", q32, k_sel) * scale
+            ref_scores = ref_scores.masked_fill(~valid[:, None], float("-inf"))
+            p = torch.softmax(ref_scores, dim=-1).nan_to_num(0.0)
+            ref_out = torch.einsum("bhqt,bqtd->bqhd", p, k_sel[..., :latent_d])
+            ref_out.backward(dout)
+
+            torch.testing.assert_close(out.float(), ref_out.detach(), atol=2e-2, rtol=1e-2)
+            torch.testing.assert_close(q.grad.float(), q32.grad.detach(), atol=2e-2, rtol=1e-2)
+            torch.testing.assert_close(kv.grad.float(), kv32.grad.detach(), atol=5e-2, rtol=1e-2)
 
 
 @slow
