@@ -1530,26 +1530,37 @@ def _env_int(name, default):
 
 
 @functools.cache
-def _latent_mla_configs():
+def _latent_mla_configs(valid_all: bool = True):
     """(BLOCK_H, BLOCK_N, num_warps, num_stages) for (forward, backward).
 
-    Measured on H200 (see fork benchmarks) at DeepSeek-3.2 shapes
-    (H=128, D=576, topk=2048). Blackwell datacenter parts (sm100/sm103) keep
-    BLOCK_H >= 64 tiles: tcgen05 MMA holds the fp32 accumulators in TMEM, so
-    the wide-tile register pressure of Hopper does not apply, and BLOCK_M >= 64
-    single-dot-per-accumulator loops are the pattern already validated bitwise
-    on B300 by the chunked GRPO loss kernels. DSMLA_* env vars override for
-    tuning experiments.
+    Measured at DeepSeek-3.2 shapes (H=128, D=576, topk=2048): sm_90 on H200,
+    sm_100/sm_103 on B300 (subprocess-isolated correctness + timing sweep over
+    BLOCK_H/BLOCK_N/warps/stages). DSMLA_* env vars override for tuning
+    experiments.
+
+    sm_103 (B300, Triton 3.6) hard constraints found by the sweep — these are
+    launch/compile failures, not tuning preferences:
+      - forward BLOCK_H=64: every variant either miscompiles into misaligned
+        tcgen05 addresses (BN<=32) or needs 352-632 KB SMEM vs the 227 KB
+        budget (BN>=64), so Blackwell forward tiles cap at BLOCK_H=32.
+        BLOCK_H=128 exceeds the 512-column TMEM budget outright.
+      - backward BLOCK_N>=64: the extra dp/dk/dv accumulators exceed TMEM
+        (576 cols needed vs 512), so backward keeps BLOCK_N<=32.
     """
     capability = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
-    if capability[0] >= 9:
+    if capability[0] == 9:
         # H200-measured optimum (fwd 0.37 ms / bwd 4.2 ms per 128-query chunk
-        # at topk=2048). Kept identical on sm100/sm103: the SMEM budget is the
-        # same 228 KB (backward BLOCK_H=64 needs 385 KB and fails to launch on
-        # both), and BLOCK_H=64 forward tiles engage tcgen05 with the
-        # single-dot-per-accumulator structure validated on B300.
+        # at topk=2048).
         fwd = (64, 64, 8, 2)
         bwd = (32, 32, 8, 2)
+    elif capability[0] == 10:
+        # B300-measured (sm_103). Valid-all chunks (steady state for long
+        # sequences) run fastest at BN=64/S=3 (0.28 ms fwd, 4.4 ms bwd);
+        # mixed-validity chunks (early positions with masked lanes) prefer
+        # BN=128/W=8 forward (0.52 vs 0.79 ms) and the small BH=BN=16 tile
+        # backward (2.12 vs 2.32 ms).
+        fwd = (32, 64, 4, 3) if valid_all else (32, 128, 8, 2)
+        bwd = (32, 32, 8, 2) if valid_all else (16, 16, 4, 2)
     else:
         fwd = (16, 32, 4, 2)
         bwd = (16, 32, 4, 2)
@@ -1592,7 +1603,7 @@ class _SparseMLALatentTritonFunction(torch.autograd.Function):
         topk_n = topk.shape[-1]
         rope_d = head_dim - latent_d
 
-        (block_h, block_n, num_warps, num_stages), _ = _latent_mla_configs()
+        (block_h, block_n, num_warps, num_stages), _ = _latent_mla_configs(valid_all)
         out = torch.empty(batch_size, query_len, num_heads, latent_d, device=q.device, dtype=q.dtype)
         lse = torch.empty(batch_size, query_len, num_heads, device=q.device, dtype=torch.float32)
         head_blocks = triton.cdiv(num_heads, block_h)
@@ -1638,7 +1649,7 @@ class _SparseMLALatentTritonFunction(torch.autograd.Function):
         # delta = rowsum(out * dout) per (b, q, h) — one cheap fused pass.
         delta = (out.float() * dout.float()).sum(dim=-1)
 
-        _, (block_h, block_n, num_warps, num_stages) = _latent_mla_configs()
+        _, (block_h, block_n, num_warps, num_stages) = _latent_mla_configs(valid_all)
         dq = torch.empty_like(q)
         dkv = torch.zeros_like(kv, dtype=torch.float32)
         head_blocks = triton.cdiv(num_heads, block_h)
